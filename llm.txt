@@ -1,0 +1,57 @@
+# UCSKit LLM Context
+
+This file is intended to provide Large Language Models (LLMs) and AI agents with the necessary context, architectural overview, and usage patterns to effectively write code that integrates with or modifies `UCSKit`.
+
+## Overview
+`UCSKit` is a Swift Package for parsing and searching the Universal Category System (UCS) v8.2.1 — a standard for classifying sound effects. 
+
+The library is strictly decoupled from any persistence layer. It provides the domain models, the CSV parser, and the search algorithm, leaving the host app to decide how to store the data (Realm, CoreData, SwiftData).
+
+## Key Architecture
+
+### 1. `UCSCategory` (Model)
+- **Path**: `Sources/UCSKit/Models/UCSCategory.swift`
+- **Definition**: `public struct UCSCategory: Codable, Hashable, Identifiable, Sendable`
+- **Key Fields**:
+  - `catID` (String): The primary unique identifier (e.g. `AMBUrbn`). Also serves as `id`.
+  - `category` (String): Top level category (e.g. `AMBIENCE`).
+  - `subCategory` (String): Sub-classification (e.g. `URBAN`).
+  - `synonyms` ([String]): An array of search synonyms.
+
+### 2. `UCSParser` (Actor)
+- **Path**: `Sources/UCSKit/Parsing/UCSParser.swift`
+- **Behavior**: An isolated `actor` that parses RFC 4180 compliant CSVs line-by-line without blocking the main thread.
+- **Data rules**: It correctly handles double-quote escaped strings containing commas (which is how the UCS CSV formats its synonym lists).
+- **Delegation**: Uses a batching system (default `batchSize: 100`). It yields to the system and calls `UCSPersistenceDelegate` asynchronously so the host app can persist batches incrementally.
+
+### 3. `UCSPersistenceDelegate` (Protocol)
+- **Path**: `Sources/UCSKit/Parsing/UCSPersistenceDelegate.swift`
+- **Behavior**: The bridge between the library and the host app.
+- **Requirements**: Implementations must be `Sendable` because they are called from within the `UCSParser` actor.
+- **Methods**:
+  - `func didParseBatch(_ categories: [UCSCategory]) async throws`
+  - `func didFinishParsing(totalCount: Int) async`
+  - `func didEncounterError(_ error: UCSParserError) async`
+
+### 4. `UCSSearchEngine` (Search)
+- **Path**: `Sources/UCSKit/Search/UCSSearchEngine.swift`
+- **Behavior**: A `Sendable` struct providing a `static` search function.
+- **Algorithm**: It splits the query into tokens. For each token, it calculates a weighted score based on exact matches and prefix matches against `category`, `subCategory`, and `synonyms`.
+- **Semantic Fallback**: Uses `NLEmbedding.wordEmbedding(for: .english)` to find semantic neighbors for the search tokens (e.g., query "car" -> matches synonym "automobile") if the exact/prefix score is too low.
+
+## Common Agent Tasks
+
+### If asked to integrate UCSKit into an app:
+1. Conform an object (like a Database Manager) to `UCSPersistenceDelegate`. Ensure it is `@unchecked Sendable` or strictly concurrency safe.
+2. Initialize `UCSParser(batchSize: 100)`.
+3. Call `await parser.setDelegate(yourManager)`.
+4. Call `try await parser.parse(fileAt: csvURL)`.
+5. Use `UCSSearchEngine.search(...)` to filter the data for the UI.
+
+### If asked to update the CSV data:
+1. The canonical data is in `Sources/UCSKit/Resources/UCS_v8.2.1.csv`.
+2. Ensure any new CSV follows RFC 4180 rules.
+3. The parser specifically skips rows starting with `"Category"`, `"UCS v8.2.1 Category List"`, or `"8.2.1 adds no new categories"` to ignore the headers found in the official Google Sheets export. If the header format changes, update the skip logic in `UCSParser.swift`.
+
+## Concurrency Notes
+This package uses `swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]`. Any code added must compile without warnings in Swift 6 mode. Use `nonisolated`, `@MainActor`, or `@preconcurrency` as needed to resolve Sendable warnings.
